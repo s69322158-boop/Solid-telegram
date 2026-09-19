@@ -1,0 +1,510 @@
+import sqlite3
+import datetime
+import time
+import telebot
+from telebot import types
+
+# -------------------------------------------------------------
+# CONFIGURATION SETTINGS
+# -------------------------------------------------------------
+TOKEN = '8977940302:AAHUI1eIwnUOX3wuyMUyMDHO16hAC2cinOA'
+ADMIN_ID = 157828443  # Your Telegram User ID
+SUPPORT_USERNAME = "@Sammywater"
+
+# BANK DETAILS FOR VIP PAYMENTS
+BANK_NAME = "Smartcash PSB"
+ACCOUNT_NUMBER = "9048757281"
+ACCOUNT_NAME = "Sunday Oladapo"
+
+# PAYOUT SETTINGS (25th to 30th of every month)
+PAYOUT_START_DAY = 25
+PAYOUT_END_DAY = 30
+REFERRAL_BONUS = 25000  # 25,000 points per invite
+TAP_COOLDOWN_SECONDS = 1
+
+# VIP CONFIGURATION
+VIP_PRICES = {1: 1000, 2: 2500, 3: 5000, 4: 10000, 5: 15000}
+VIP_MULTIPLIER = {0: 1, 1: 2, 2: 3, 3: 5, 4: 10, 5: 20}
+VIP_MIN_WITHDRAW = {0: 10000000, 1: 5000000, 2: 3500000, 3: 2500000, 4: 2000000, 5: 1500000}  # Points threshold
+VIP_REF_REQUIRED = {0: 3, 1: 1, 2: 0, 3: 0, 4: 0, 5: 0}  # Required referrals to unlock payout
+
+# DYNAMIC SOCIAL MEDIA TASKS
+TASKS = [
+    {"id": 1, "platform": "📺 YouTube", "title": "Watch 1-Min Video & Subscribe", "link": "https://youtube.com", "reward": 3000},
+    {"id": 2, "platform": "📽 Rumble", "title": "Watch Rumble Video", "link": "https://rumble.com", "reward": 2500},
+    {"id": 3, "platform": "📘 Facebook", "title": "Follow Facebook Page", "link": "https://facebook.com", "reward": 2000},
+    {"id": 4, "platform": "👻 Snapchat", "title": "Subscribe on Snapchat", "link": "https://snapchat.com", "reward": 2000}
+]
+
+bot = telebot.TeleBot(TOKEN)
+
+# -------------------------------------------------------------
+# DATABASE SETUP
+# -------------------------------------------------------------
+conn = sqlite3.connect('earnroom.db', check_same_thread=False)
+c = conn.cursor()
+
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY, 
+                balance REAL DEFAULT 0, 
+                vip_level INTEGER DEFAULT 0,
+                last_tap_date TEXT, 
+                daily_taps INTEGER DEFAULT 0,
+                join_date TEXT, 
+                referred_by INTEGER DEFAULT 0,
+                referral_count INTEGER DEFAULT 0
+            )''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS completed_tasks (
+                user_id INTEGER,
+                task_id INTEGER,
+                PRIMARY KEY (user_id, task_id)
+            )''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                points REAL,
+                bank_info TEXT,
+                status TEXT
+            )''')
+conn.commit()
+
+user_states = {}
+last_tap_timestamps = {}
+
+def get_user(user_id):
+    c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+    return c.fetchone()
+
+def can_withdraw():
+    today = datetime.datetime.now().day
+    return PAYOUT_START_DAY <= today <= PAYOUT_END_DAY
+
+# -------------------------------------------------------------
+# USER COMMANDS
+# -------------------------------------------------------------
+@bot.message_handler(commands=['start'])
+def start(message):
+    user_id = message.from_user.id
+    today_str = str(datetime.date.today())
+    
+    command_args = message.text.split()
+    referrer_id = 0
+    if len(command_args) > 1 and command_args[1].isdigit():
+        referrer_id = int(command_args[1])
+        if referrer_id == user_id:
+            referrer_id = 0
+
+    if not get_user(user_id):
+        c.execute("INSERT INTO users (user_id, balance, vip_level, last_tap_date, daily_taps, join_date, referred_by, referral_count) VALUES (?, 0, 0, ?, 0, ?, ?, 0)",
+                  (user_id, today_str, today_str, referrer_id))
+        conn.commit()
+
+        if referrer_id != 0:
+            ref_user = get_user(referrer_id)
+            if ref_user:
+                new_ref_balance = ref_user[1] + REFERRAL_BONUS
+                new_ref_count = ref_user[7] + 1
+                c.execute("UPDATE users SET balance=?, referral_count=? WHERE user_id=?", (new_ref_balance, new_ref_count, referrer_id))
+                conn.commit()
+                try:
+                    bot.send_message(referrer_id, f"🎉 *New Referral!* You earned {REFERRAL_BONUS:,} points!", parse_mode='Markdown')
+                except Exception:
+                    pass
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add('💰 Tap to Earn', '📋 Tasks')
+    markup.add('👑 VIP', '👥 Referral')
+    markup.add('💸 Withdraw', '📊 Balance')
+    markup.add('📞 Support')
+
+    bot.send_message(
+        user_id,
+        f"""*Welcome to EarnRoomTap* 🇳🇬
+
+Earn money by tapping and watching videos!
+
+*IMPORTANT RULES:*
+📅 Withdrawals: *25th – 30th of every month*
+👥 Free Users: *3 referrals required to cash out*
+👑 VIP Users: *Lower thresholds & instant payouts*
+
+God bless your hustle 🙏""",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+# -------------------------------------------------------------
+# TASK ENGINE
+# -------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == '📋 Tasks')
+def task_menu(message):
+    user_id = message.from_user.id
+    
+    markup = types.InlineKeyboardMarkup()
+    for task in TASKS:
+        c.execute("SELECT * FROM completed_tasks WHERE user_id=? AND task_id=?", (user_id, task["id"]))
+        if c.fetchone():
+            status = "✅ Done"
+        else:
+            status = f"+{task['reward']:,} pts"
+        
+        btn_text = f"{task['platform']} - {task['title']} ({status})"
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"view_task_{task['id']}"))
+
+    bot.send_message(user_id, "📋 *Available Social Media Tasks*\n\nComplete tasks to earn points fast:", parse_mode='Markdown', reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("view_task_"))
+def handle_task_click(call):
+    user_id = call.from_user.id
+    task_id = int(call.data.split("_")[2])
+    task = next((t for t in TASKS if t["id"] == task_id), None)
+
+    if not task:
+        return
+
+    c.execute("SELECT * FROM completed_tasks WHERE user_id=? AND task_id=?", (user_id, task_id))
+    if c.fetchone():
+        bot.answer_callback_query(call.id, "You have already completed this task!", show_alert=True)
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🔗 Open Task Link", url=task["link"]))
+    markup.add(types.InlineKeyboardButton("✅ Claim Reward", callback_data=f"claim_task_{task_id}"))
+
+    bot.send_message(
+        user_id,
+        f"📌 *{task['platform']} Task*\n\n1. Click 'Open Task Link' and watch/follow.\n2. Return here and click 'Claim Reward'.\n\n💰 Reward: *{task['reward']:,} points*",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("claim_task_"))
+def claim_task_reward(call):
+    user_id = call.from_user.id
+    task_id = int(call.data.split("_")[2])
+    task = next((t for t in TASKS if t["id"] == task_id), None)
+
+    if not task:
+        return
+
+    c.execute("SELECT * FROM completed_tasks WHERE user_id=? AND task_id=?", (user_id, task_id))
+    if c.fetchone():
+        bot.answer_callback_query(call.id, "Already claimed!", show_alert=True)
+        return
+
+    user = get_user(user_id)
+    new_balance = user[1] + task["reward"]
+
+    c.execute("INSERT INTO completed_tasks (user_id, task_id) VALUES (?, ?)", (user_id, task_id))
+    c.execute("UPDATE users SET balance=? WHERE user_id=?", (new_balance, user_id))
+    conn.commit()
+
+    bot.send_message(user_id, f"🎉 *Task Completed!*\nYou earned *+{task['reward']:,} points*!\n💰 Balance: {new_balance:,.0f} points", parse_mode='Markdown')
+
+# -------------------------------------------------------------
+# TAP TO EARN
+# -------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == '💰 Tap to Earn')
+def tap(message):
+    user_id = message.from_user.id
+    current_time = time.time()
+
+    if user_id in last_tap_timestamps:
+        if current_time - last_tap_timestamps[user_id] < TAP_COOLDOWN_SECONDS:
+            bot.send_message(user_id, "⚠️ *Slow down!* Please wait a second between taps.", parse_mode='Markdown')
+            return
+
+    last_tap_timestamps[user_id] = current_time
+
+    user = get_user(user_id)
+    if not user:
+        bot.send_message(user_id, "Please press /start to begin.")
+        return
+
+    today_str = str(datetime.date.today())
+    last_tap_date, daily_taps = user[3], user[4]
+    vip = user[2]
+    
+    daily_limit = 50 if vip == 0 else (100 * vip)
+
+    if last_tap_date != today_str:
+        daily_taps = 0
+
+    if daily_taps >= daily_limit:
+        bot.send_message(user_id, f"⚠️ *Daily Limit Reached!*\nYou reached your limit of {daily_limit} taps today. Upgrade to VIP to tap more!", parse_mode='Markdown')
+        return
+
+    earn = 10 * VIP_MULTIPLIER.get(vip, 1)
+    new_balance = user[1] + earn
+    new_daily_taps = daily_taps + 1
+
+    c.execute("UPDATE users SET balance=?, last_tap_date=?, daily_taps=? WHERE user_id=?", 
+              (new_balance, today_str, new_daily_taps, user_id))
+    conn.commit()
+
+    remaining_taps = daily_limit - new_daily_taps
+    bot.send_message(user_id, f"✅ +{earn} pts\n💰 Balance: {new_balance:,.0f} pts\n🎯 Taps remaining today: {remaining_taps}")
+
+@bot.message_handler(func=lambda m: m.text == '📊 Balance')
+def balance_check(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    if user:
+        vip = user[2]
+        daily_limit = 50 if vip == 0 else (100 * vip)
+        bot.send_message(
+            user_id, 
+            f"📊 *Your Account Overview*\n\n💰 Balance: {user[1]:,.0f} points\n👥 Active Referrals: {user[7]}\n👑 VIP Status: VIP{vip}\n🎯 Daily Taps Used: {user[4]}/{daily_limit}", 
+            parse_mode='Markdown'
+        )
+
+@bot.message_handler(func=lambda m: m.text == '📞 Support')
+def support_contact(message):
+    bot.send_message(
+        message.from_user.id,
+        f"📞 *Customer Support*\n\nIf you have any questions or payment issues, contact the admin directly:\n\n👤 Telegram: {SUPPORT_USERNAME}",
+        parse_mode='Markdown'
+    )
+
+# -------------------------------------------------------------
+# VIP SYSTEM
+# -------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == '👑 VIP')
+def vip_menu(message):
+    text = "*👑 VIP PLANS - FASTER CASHOUTS & HIGHER EARNINGS*\n\n"
+    for level, price in VIP_PRICES.items():
+        min_pts = VIP_MIN_WITHDRAW[level]
+        refs = VIP_REF_REQUIRED[level]
+        text += f"*VIP{level}*: ₦{price} ({VIP_MULTIPLIER[level]}x earnings | Min Cashout: {min_pts:,.0f} pts | Refs Required: {refs})\n"
+    
+    text += f"""
+----------------------------------
+💳 *PAYMENT DETAILS*
+🏦 Bank Name: `{BANK_NAME}`
+🔢 Account Number: `{ACCOUNT_NUMBER}`
+👤 Account Name: `{ACCOUNT_NAME}`
+----------------------------------
+
+*How to upgrade:*
+1. Transfer the exact amount for your chosen VIP plan.
+2. Click the button below to upload your payment receipt photo!
+"""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📩 Submit Payment Proof", callback_data="submit_vip_proof"))
+    bot.send_message(message.from_user.id, text, parse_mode='Markdown', reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "submit_vip_proof")
+def ask_vip_proof(call):
+    user_states[call.from_user.id] = 'awaiting_vip_proof'
+    bot.send_message(call.from_user.id, "Please send a *Photo of your Bank Receipt* or type your *Sender Name, Amount, and VIP Level requested*:", parse_mode='Markdown')
+
+# -------------------------------------------------------------
+# WITHDRAWAL SYSTEM
+# -------------------------------------------------------------
+@bot.message_handler(func=lambda m: m.text == '💸 Withdraw')
+def withdraw(message):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        bot.send_message(user_id, "Please press /start to begin.")
+        return
+
+    balance = user[1]
+    vip = user[2]
+    ref_count = user[7]
+
+    min_required_pts = VIP_MIN_WITHDRAW.get(vip, 10000000)
+    refs_required = VIP_REF_REQUIRED.get(vip, 3)
+
+    if not can_withdraw():
+        bot.send_message(
+            user_id,
+            f"""❌ *Withdrawals are currently CLOSED*
+
+📅 Withdrawals open from the *25th to 30th* of every month.
+
+Current Balance: {balance:,.0f} points
+Keep tapping and watching videos! 💪""",
+            parse_mode='Markdown'
+        )
+        return
+
+    if ref_count < refs_required:
+        bot.send_message(
+            user_id,
+            f"❌ *Referral Gate Locked!*\n\nFree users must invite at least *{refs_required} active friends* to unlock withdrawals.\nYour Referrals: *{ref_count}/{refs_required}*\n\n💡 *Tip:* Upgrade to VIP2 or higher to remove the referral requirement completely!",
+            parse_mode='Markdown'
+        )
+        return
+
+    if balance < min_required_pts:
+        bot.send_message(
+            user_id,
+            f"❌ *Insufficient Balance*\n\nYour VIP level requires a minimum of *{min_required_pts:,.0f} points* to cash out.\nYour Balance: *{balance:,.0f} points*",
+            parse_mode='Markdown'
+        )
+        return
+
+    user_states[user_id] = 'awaiting_bank_details'
+    bot.send_message(
+        user_id,
+        f"💸 *Withdrawal Request*\n\nPoints to withdraw: *{balance:,.0f}*\n\nPlease reply with your Bank Details in this format:\n\n`Bank Name, Account Number, Account Name`",
+        parse_mode='Markdown'
+    )
+
+# -------------------------------------------------------------
+# PROOFS & INPUT HANDLING
+# -------------------------------------------------------------
+@bot.message_handler(content_types=['text', 'photo'], func=lambda m: m.from_user.id in user_states)
+def handle_user_input(message):
+    user_id = message.from_user.id
+    state = user_states.get(user_id)
+
+    if state == 'awaiting_vip_proof':
+        del user_states[user_id]
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("VIP 1", callback_data=f"approve_vip_{user_id}_1"),
+            types.InlineKeyboardButton("VIP 2", callback_data=f"approve_vip_{user_id}_2"),
+            types.InlineKeyboardButton("VIP 3", callback_data=f"approve_vip_{user_id}_3")
+        )
+        markup.add(
+            types.InlineKeyboardButton("VIP 4", callback_data=f"approve_vip_{user_id}_4"),
+            types.InlineKeyboardButton("VIP 5", callback_data=f"approve_vip_{user_id}_5")
+        )
+        markup.add(types.InlineKeyboardButton("❌ Reject", callback_data=f"reject_vip_{user_id}"))
+
+        if message.content_type == 'photo':
+            photo_id = message.photo[-1].file_id
+            caption = message.caption if message.caption else "No details written."
+            bot.send_photo(
+                ADMIN_ID,
+                photo_id,
+                caption=f"🔔 *NEW VIP PAYMENT RECEIPT*\n\n*User ID:* `{user_id}`\n*Caption:* {caption}",
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+        else:
+            bot.send_message(
+                ADMIN_ID,
+                f"🔔 *NEW VIP PAYMENT PROOF*\n\n*User ID:* `{user_id}`\n*Details:* {message.text}",
+                parse_mode='Markdown',
+                reply_markup=markup
+            )
+
+        bot.send_message(user_id, "✅ Your payment details have been sent to the admin. You will be upgraded shortly!")
+
+    elif state == 'awaiting_bank_details':
+        if message.content_type != 'text':
+            bot.send_message(user_id, "Please supply text containing your bank details.")
+            return
+
+        del user_states[user_id]
+        user = get_user(user_id)
+        balance = user[1]
+
+        bank_info = message.text
+        c.execute("INSERT INTO withdrawals (user_id, points, bank_info, status) VALUES (?, ?, ?, 'Pending')",
+                  (user_id, balance, bank_info))
+        c.execute("UPDATE users SET balance=0 WHERE user_id=?", (user_id,))
+        conn.commit()
+
+        bot.send_message(
+            ADMIN_ID,
+            f"💸 *NEW WITHDRAWAL REQUEST*\n\n*User ID:* `{user_id}`\n*Points:* {balance:,.0f}\n*Bank Details:* {bank_info}",
+            parse_mode='Markdown'
+        )
+        bot.send_message(user_id, "✅ *Withdrawal Request Submitted!*\nYour payout will be processed during the 25th–30th payout window.")
+
+# -------------------------------------------------------------
+# ADMIN ACTIONS
+# -------------------------------------------------------------
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("approve_vip_", "reject_vip_")))
+def process_vip_approval(call):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    data = call.data.split("_")
+    action = data[0]
+    target_user_id = int(data[2])
+
+    if action == "approve":
+        vip_level = int(data[3])
+        c.execute("UPDATE users SET vip_level=? WHERE user_id=?", (vip_level, target_user_id))
+        conn.commit()
+
+        bot.send_message(call.message.chat.id, f"✅ Approved VIP{vip_level} for User `{target_user_id}`", parse_mode='Markdown')
+        try:
+            bot.send_message(target_user_id, f"🎉 *Congratulations!* Your payment was verified and your account is upgraded to *VIP{vip_level}*!", parse_mode='Markdown')
+        except Exception:
+            pass
+
+    elif action == "reject":
+        bot.send_message(call.message.chat.id, f"❌ Rejected VIP upgrade for User `{target_user_id}`", parse_mode='Markdown')
+        try:
+            bot.send_message(target_user_id, "❌ Your VIP payment proof could not be verified. Please contact support.")
+        except Exception:
+            pass
+
+@bot.message_handler(func=lambda m: m.text == '👥 Referral')
+def referral(message):
+    user_id = message.from_user.id
+    bot_info = bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    user = get_user(user_id)
+    ref_count = user[7] if user else 0
+    bot.send_message(
+        user_id,
+        f"👥 *Referral Program*\n\nInvite friends and earn *{REFERRAL_BONUS:,} points* per referral!\n\nYour Total Referrals: *{ref_count}*\nYour Link:\n`{ref_link}`",
+        parse_mode='Markdown'
+    )
+
+# -------------------------------------------------------------
+# ADMIN BROADCAST
+# -------------------------------------------------------------
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    c.execute("SELECT COUNT(*), SUM(balance) FROM users")
+    stats = c.fetchone()
+    total_users = stats[0]
+    total_balance = stats[1] if stats[1] else 0
+
+    bot.send_message(
+        ADMIN_ID,
+        f"🛠 *Admin Dashboard*\n\n👥 Total Users: {total_users}\n💰 Total User Points: {total_balance:,.0f}\n\n*Broadcast command:* `/broadcast Your message here`",
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast_message(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    text_to_send = message.text.replace("/broadcast", "").strip()
+    if not text_to_send:
+        bot.send_message(ADMIN_ID, "Usage: `/broadcast Your message here`", parse_mode='Markdown')
+        return
+
+    c.execute("SELECT user_id FROM users")
+    users = c.fetchall()
+    
+    successful, failed = 0, 0
+    for u in users:
+        try:
+            bot.send_message(u[0], f"📢 *ANNOUNCEMENT*\n\n{text_to_send}", parse_mode='Markdown')
+            successful += 1
+        except Exception:
+            failed += 1
+
+    bot.send_message(ADMIN_ID, f"✅ Broadcast Complete!\n\nSent to: {successful} users\nFailed: {failed} users")
+
+if __name__ == '__main__':
+    print("EarnRoomTap Bot is online...")
+    bot.infinity_polling()
